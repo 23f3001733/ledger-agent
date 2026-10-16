@@ -42,13 +42,23 @@ def page_url(p):
 # ---------- 1. load + clean data ----------
 def build():
     global DATA, INFO
-    first = get_json(page_url(1))
-    rows = list(first["orders"])
-    n_pages = int(first.get("pages", 1))
-    if n_pages > 1:
-        with ThreadPoolExecutor(8) as ex:
-            for d in ex.map(lambda p: get_json(page_url(p)), range(2, n_pages + 1)):
-                rows += d["orders"]
+    rows, n_pages = None, 0
+    export_url = os.environ.get("EXPORT_URL", "")
+    if export_url:
+        try:
+            txt = requests.get(export_url, timeout=30).text
+            rows = [json.loads(l) for l in txt.splitlines() if l.strip()]
+            n_pages = -1
+        except Exception:
+            rows = None
+    if not rows:
+        first = get_json(page_url(1))
+        rows = list(first["orders"])
+        n_pages = int(first.get("pages", 1))
+        if n_pages > 1:
+            with ThreadPoolExecutor(8) as ex:
+                for d in ex.map(lambda p: get_json(page_url(p)), range(2, n_pages + 1)):
+                    rows += d["orders"]
     df = pd.DataFrame(rows)
     raw_rows = len(df)
 
