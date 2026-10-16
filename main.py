@@ -26,14 +26,14 @@ Database Schema (Table: `orders`):
 - order_id (TEXT): Unique ID of the order.
 - status (TEXT): Order status e.g., 'paid', 'refunded', 'pending'. Always use LOWER(status) when comparing.
 - region (TEXT): Region name e.g., 'Central', 'North', 'South', 'East', 'West'. Always use LOWER(region) when comparing.
-- created_at (TEXT): ISO timestamp string.
+- created_at (TEXT): Raw timestamp string.
 - created_date (TEXT): Date in 'YYYY-MM-DD' format (Asia/Kolkata timezone).
 - created_year_month (TEXT): Date in 'YYYY-MM' format e.g., '2026-02' (Asia/Kolkata timezone).
-- amount (REAL): Monetary amount.
+- amount (REAL): Monetary amount in original currency.
 - currency (TEXT): Currency code e.g., 'USD', 'INR', 'EUR'.
 - product_name (TEXT): Name of the product.
 - customer_id (TEXT): Customer identifier.
-- usd_amount (REAL): Amount converted directly to USD.
+- usd_amount (REAL): Monetary amount pre-converted to USD.
 
 Database Schema (Table: `rates`):
 - currency (TEXT): Currency code.
@@ -42,7 +42,7 @@ Database Schema (Table: `rates`):
 Rules for Query Generation:
 1. ALWAYS wrap aggregate results with COALESCE to prevent null returns:
    - Use `SELECT COALESCE(COUNT(*), 0)` instead of `SELECT COUNT(*)`.
-   - Use `SELECT COALESCE(SUM(usd_amount), 0.0)` for revenue queries.
+   - Use `SELECT COALESCE(SUM(usd_amount), 0.0)` for revenue / monetary questions.
 2. Filter status and region case-insensitively using LOWER():
    - e.g., `LOWER(status) = 'refunded'` AND `LOWER(region) = 'central'`
 3. Revenue queries strictly require `LOWER(status) = 'paid'`.
@@ -58,19 +58,23 @@ def fetch_all_orders():
     
     while True:
         url = f"{base_url}&page={page}"
-        res = requests.get(url, timeout=15)
-        if res.status_code != 200:
+        try:
+            res = requests.get(url, timeout=15)
+            if res.status_code != 200:
+                break
+            data = res.json()
+            orders = data.get("orders", data.get("data", []))
+            if not orders:
+                break
+            all_orders.extend(orders)
+            
+            has_next = data.get("has_next", False) or page < data.get("total_pages", 1)
+            if not has_next:
+                break
+            page += 1
+        except Exception as e:
+            print(f"Error fetching page {page}: {e}")
             break
-        data = res.json()
-        orders = data.get("orders", data.get("data", []))
-        if not orders:
-            break
-        all_orders.extend(orders)
-        
-        has_next = data.get("has_next", False) or page < data.get("total_pages", 1)
-        if not has_next:
-            break
-        page += 1
         
     return pd.DataFrame(all_orders)
 
@@ -80,14 +84,17 @@ def sync_database():
         return
 
     print("Fetching rates...")
-    rates_res = requests.get(RATES_URL, timeout=15).json()
-    rates_data = rates_res.get("rates", {})
-    
-    # Format exchange rates into DataFrame
-    if isinstance(rates_data, dict):
-        df_rates = pd.DataFrame([{"currency": k, "rate_to_usd": v} for k, v in rates_data.items()])
-    else:
-        df_rates = pd.DataFrame(rates_data)
+    try:
+        rates_res = requests.get(RATES_URL, timeout=15).json()
+        rates_data = rates_res.get("rates", {})
+        
+        if isinstance(rates_data, dict):
+            df_rates = pd.DataFrame([{"currency": k, "rate_to_usd": v} for k, v in rates_data.items()])
+        else:
+            df_rates = pd.DataFrame(rates_data)
+    except Exception as e:
+        print(f"Failed to fetch rates: {e}")
+        df_rates = pd.DataFrame(columns=["currency", "rate_to_usd"])
 
     print("Fetching orders...")
     df_orders = fetch_all_orders()
@@ -96,24 +103,29 @@ def sync_database():
         print("No orders fetched.")
         return
 
-    # Normalize ID field
+    # Normalize ID field name across schemas
     if "order_id" not in df_orders.columns and "id" in df_orders.columns:
         df_orders["order_id"] = df_orders["id"]
 
-    # Deduplicate orders: Sort by updated_at and keep the last entry per order_id
-    df_orders["updated_at_dt"] = pd.to_datetime(df_orders["updated_at"], errors="coerce")
+    # FIX 1: Enforce utc=True to eliminate "Mixed timezones detected" error across ISO offsets (+05:30 vs Z)
+    df_orders["updated_at_dt"] = pd.to_datetime(df_orders["updated_at"], utc=True, errors="coerce")
+    
+    # Deduplicate orders: keep the row with the latest updated_at per order_id
     df_orders = df_orders.sort_values("updated_at_dt").groupby("order_id").last().reset_index()
 
-    # Convert timestamps strictly to Asia/Kolkata timezone
-    created_dt = pd.to_datetime(df_orders["created_at"], utc=True).dt.tz_convert("Asia/Kolkata")
+    # FIX 2: Safely convert timestamps to Asia/Kolkata target timezone
+    created_dt = pd.to_datetime(df_orders["created_at"], utc=True, errors="coerce").dt.tz_convert("Asia/Kolkata")
     df_orders["created_date"] = created_dt.dt.strftime("%Y-%m-%d")
     df_orders["created_year_month"] = created_dt.dt.strftime("%Y-%m")
 
-    # Map USD converted amounts directly into the table
+    # FIX 3: Pre-calculate USD conversions into usd_amount column
     rate_map = df_rates.set_index("currency")["rate_to_usd"].to_dict() if not df_rates.empty else {}
     df_orders["usd_amount"] = df_orders.apply(
-        lambda r: float(r["amount"]) * rate_map.get(r["currency"], 1.0), axis=1
+        lambda r: float(r["amount"]) * float(rate_map.get(r["currency"], 1.0)), axis=1
     )
+
+    # Cast timestamp objects back to strings before writing to SQLite
+    df_orders["updated_at_dt"] = df_orders["updated_at_dt"].astype(str)
 
     # Persist into SQLite
     conn = sqlite3.connect(DB_PATH)
@@ -124,7 +136,7 @@ def sync_database():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Perform database sync on server launch
+    # Execute database sync during service launch
     sync_database()
     yield
 
