@@ -53,7 +53,6 @@ Rules for Query Generation:
 def fetch_all_orders():
     all_orders = []
     page = 1
-    # Strip existing page param to construct standard pagination URL
     base_url = ORDERS_URL.split("&page=")[0] if ORDERS_URL else ""
     
     while True:
@@ -84,100 +83,67 @@ def sync_database():
         return
 
     print("Fetching rates...")
+    df_rates = pd.DataFrame(columns=["currency", "rate_to_usd"]) # Pre-initialize columns to prevent SQL syntax crash
     try:
         rates_res = requests.get(RATES_URL, timeout=15).json()
         rates_data = rates_res.get("rates", {})
         
-        if isinstance(rates_data, dict):
+        if isinstance(rates_data, dict) and rates_data:
             df_rates = pd.DataFrame([{"currency": k, "rate_to_usd": v} for k, v in rates_data.items()])
-        else:
+        elif isinstance(rates_data, list) and rates_data:
             df_rates = pd.DataFrame(rates_data)
     except Exception as e:
         print(f"Failed to fetch rates: {e}")
-        df_rates = pd.DataFrame(columns=["currency", "rate_to_usd"])
+
+    # Safety check: Force columns to exist even if API returned empty
+    for col in ["currency", "rate_to_usd"]:
+        if col not in df_rates.columns:
+            df_rates[col] = pd.Series(dtype='float64' if col == 'rate_to_usd' else 'object')
 
     print("Fetching orders...")
     df_orders = fetch_all_orders()
     
-    if df_orders.empty:
-        print("No orders fetched.")
-        return
+    # Pre-initialize order schema to prevent SQL syntax crash if API is completely empty
+    expected_order_cols = [
+        "order_id", "status", "region", "created_at", "updated_at",
+        "amount", "currency", "product_name", "customer_id", 
+        "created_date", "created_year_month", "usd_amount", "updated_at_dt"
+    ]
 
-    # Normalize ID field name across schemas
-    if "order_id" not in df_orders.columns and "id" in df_orders.columns:
-        df_orders["order_id"] = df_orders["id"]
+    if df_orders.empty or len(df_orders.columns) == 0:
+        print("No orders fetched. Creating empty schema database.")
+        df_orders = pd.DataFrame(columns=expected_order_cols)
+    else:
+        # Normalize ID field
+        if "order_id" not in df_orders.columns and "id" in df_orders.columns:
+            df_orders["order_id"] = df_orders["id"]
 
-    # FIX 1: Enforce utc=True to eliminate "Mixed timezones detected" error across ISO offsets (+05:30 vs Z)
-    df_orders["updated_at_dt"] = pd.to_datetime(df_orders["updated_at"], utc=True, errors="coerce")
-    
-    # Deduplicate orders: keep the row with the latest updated_at per order_id
-    df_orders = df_orders.sort_values("updated_at_dt").groupby("order_id").last().reset_index()
+        # Parse timezones with utc=True safely
+        df_orders["updated_at_dt"] = pd.to_datetime(df_orders["updated_at"], utc=True, errors="coerce")
+        df_orders = df_orders.sort_values("updated_at_dt").groupby("order_id").last().reset_index()
 
-    # FIX 2: Safely convert timestamps to Asia/Kolkata target timezone
-    created_dt = pd.to_datetime(df_orders["created_at"], utc=True, errors="coerce").dt.tz_convert("Asia/Kolkata")
-    df_orders["created_date"] = created_dt.dt.strftime("%Y-%m-%d")
-    df_orders["created_year_month"] = created_dt.dt.strftime("%Y-%m")
+        created_dt = pd.to_datetime(df_orders["created_at"], utc=True, errors="coerce").dt.tz_convert("Asia/Kolkata")
+        df_orders["created_date"] = created_dt.dt.strftime("%Y-%m-%d")
+        df_orders["created_year_month"] = created_dt.dt.strftime("%Y-%m")
 
-    # FIX 3: Pre-calculate USD conversions into usd_amount column
-    rate_map = df_rates.set_index("currency")["rate_to_usd"].to_dict() if not df_rates.empty else {}
-    df_orders["usd_amount"] = df_orders.apply(
-        lambda r: float(r["amount"]) * float(rate_map.get(r["currency"], 1.0)), axis=1
-    )
-
-    # Cast timestamp objects back to strings before writing to SQLite
-    df_orders["updated_at_dt"] = df_orders["updated_at_dt"].astype(str)
-
-    # Persist into SQLite
-    conn = sqlite3.connect(DB_PATH)
-    df_orders.to_sql("orders", conn, if_exists="replace", index=False)
-    df_rates.to_sql("rates", conn, if_exists="replace", index=False)
-    conn.close()
-    print("Database sync completed successfully.")
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Execute database sync during service launch
-    sync_database()
-    yield
-
-app = FastAPI(lifespan=lifespan)
-
-class QuestionRequest(BaseModel):
-    question: str
-
-def execute_sql_query(query: str):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute(query)
-    result = cursor.fetchone()
-    conn.close()
-    
-    if result is None or result[0] is None:
-        return 0
-    
-    val = result[0]
-    return round(float(val), 2) if isinstance(val, (float, int)) and not isinstance(val, bool) else val
-
-@app.post("/")
-async def answer_question(payload: QuestionRequest):
-    question = payload.question
-    
-    try:
-        response = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": question}
-            ],
-            temperature=0.0
+        # Map USD amounts
+        rate_map = df_rates.set_index("currency")["rate_to_usd"].to_dict() if not df_rates.empty else {}
+        df_orders["usd_amount"] = df_orders.apply(
+            lambda r: float(r.get("amount", 0)) * float(rate_map.get(r.get("currency"), 1.0)), axis=1
         )
+
+        df_orders["updated_at_dt"] = df_orders["updated_at_dt"].astype(str)
         
-        content = response.choices[0].message.content
-        match = re.search(r"```sql\s*(.*?)\s*```", content, re.DOTALL)
-        sql_query = match.group(1).strip() if match else content.strip()
-        
-        answer = execute_sql_query(sql_query)
-        return {"answer": answer}
-        
+        # Ensure any missing columns exist as nulls
+        for col in expected_order_cols:
+            if col not in df_orders.columns:
+                df_orders[col] = None
+
+    # Persist into SQLite safely
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        df_orders.to_sql("orders", conn, if_exists="replace", index=False)
+        df_rates.to_sql("rates", conn, if_exists="replace", index=False)
+        conn.close()
+        print("Database sync completed successfully.")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing question: {str(e)}")
