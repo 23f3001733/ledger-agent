@@ -1,98 +1,227 @@
-import os, json, requests, pandas as pd
+import os, re, json, time, datetime, threading
+import requests, pandas as pd
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 
-# ---------- settings (come from Render's Environment Variables) ----------
-LEDGER_URL = os.environ["LEDGER_URL"]          # your long URL WITHOUT "&path=..."
+# ---------- settings (from Render environment variables) ----------
+ORDERS_URL = os.environ["ORDERS_URL"]
+RATES_URL = os.environ.get("RATES_URL", "")
+MODEL = os.environ.get("LLM_MODEL", "gpt-4.1-mini")
 client = OpenAI(
     api_key=os.environ["LLM_KEY"],
-    base_url=os.environ.get("LLM_BASE", "https://api.openai.com/v1"),
+    base_url=os.environ.get("LLM_BASE") or "https://api.openai.com/v1",
+    timeout=10, max_retries=1,
 )
-MODEL = os.environ.get("LLM_MODEL", "gpt-4.1-mini")
+TZ = "Asia/Kolkata"
+DEFAULT_RATES = {"USD": 1.0, "EUR": 1.05, "INR": 0.01111}
 
-# ---------- 1. load all data once, at startup ----------
-def fetch_all(path):
-    rows = []
-    url = f"{LEDGER_URL}&path={path}"
-    while url:
-        r = requests.get(url, timeout=10).json()
-        rows += r["items"]                      # TODO: the real key holding the list
-        url = r.get("next")                     # TODO: the real "next page" key
-        # If next is just a path (e.g. "/orders?page=2"), build it:
-        # url = f"{LEDGER_URL}&path={r['next']}" if r.get("next") else None
-    return rows
+DATA, INFO = None, {}
+READY = threading.Event()
 
-orders = pd.DataFrame(fetch_all("/orders"))     # TODO: real path
-refunds = pd.DataFrame(fetch_all("/refunds"))   # TODO: real path (or delete if none)
 
-# TODO: clean the data, based on what you saw. Typical examples:
-# orders["date"] = pd.to_datetime(orders["date"])
-# orders["amount_usd"] = orders["amount_cents"] / 100
-# orders = orders.drop_duplicates("order_id")
+def get_json(url, tries=4):
+    for i in range(tries):
+        try:
+            r = requests.get(url, timeout=20)
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            if i == tries - 1:
+                raise
+            time.sleep(1 + i)
 
-# ---------- 2. LLM turns the question into a "recipe" ----------
-SYSTEM = """You convert questions about an order ledger into JSON. Output ONLY JSON:
-{"metric": "revenue" | "order_count" | "refund_total" | "refund_count" | "top_product" | "customer_count",
- "region": string or null,
- "product": string or null,
- "start": "YYYY-MM-DD" or null,
- "end": "YYYY-MM-DD" or null}
-Dates are inclusive. "March 2026" -> start 2026-03-01, end 2026-03-31.
-Regions allowed: North, South, East, West.   # TODO: your real values
-"""
 
-def make_plan(question):
-    resp = client.chat.completions.create(
-        model=MODEL,
-        temperature=0,
-        response_format={"type": "json_object"},
-        messages=[{"role": "system", "content": SYSTEM},
-                  {"role": "user", "content": question}],
-    )
-    return json.loads(resp.choices[0].message.content)
+def page_url(p):
+    if re.search(r"([?&])page=\d+", ORDERS_URL):
+        return re.sub(r"([?&])page=\d+", r"\g<1>page=%d" % p, ORDERS_URL)
+    return ORDERS_URL + "&page=%d" % p
+
+
+# ---------- 1. load + clean data ----------
+def build():
+    global DATA, INFO
+    first = get_json(page_url(1))
+    rows = list(first["orders"])
+    n_pages = int(first.get("pages", 1))
+    if n_pages > 1:
+        with ThreadPoolExecutor(8) as ex:
+            for d in ex.map(lambda p: get_json(page_url(p)), range(2, n_pages + 1)):
+                rows += d["orders"]
+    df = pd.DataFrame(rows)
+    raw_rows = len(df)
+
+    # latest updated_at wins (compare as real moments, not text)
+    df["_u"] = pd.to_datetime(df["updated_at"], utc=True, format="ISO8601")
+    df = df.sort_values("_u", kind="stable").drop_duplicates("id", keep="last")
+
+    # rates: USD value of one unit of each currency
+    rates = dict(DEFAULT_RATES)
+    if RATES_URL:
+        try:
+            r = get_json(RATES_URL)
+            rates = {k.upper(): float(v) for k, v in r["usd_per_unit"].items()}
+        except Exception:
+            pass
+
+    out = pd.DataFrame(index=df.index)
+    out["id"] = df["id"]
+    out["date"] = pd.to_datetime(df["created_at"], utc=True, format="ISO8601").dt.tz_convert(TZ)
+    out["status"] = df["status"].astype(str).str.strip().str.lower()
+    out["region"] = df["region"].astype(str).str.strip()
+    out["product"] = df["product"].astype(str).str.strip()
+    out["customer"] = df["customer"].astype(str).str.strip()
+    out["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(0)
+    cur = df["currency"].astype(str).str.strip().str.upper()
+    mult = cur.map(rates)
+    out["amount_usd"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0) * mult.fillna(0)
+
+    DATA = out
+    INFO = {
+        "raw_rows": raw_rows,
+        "rows_after_dedupe": len(out),
+        "pages": n_pages,
+        "rates": rates,
+        "unmapped_currency_rows": int(mult.isna().sum()),
+        "amount_vs_qty_x_price_mismatches": int(
+            ((pd.to_numeric(df["amount"], errors="coerce")
+              - pd.to_numeric(df["qty"], errors="coerce") * pd.to_numeric(df["unit_price"], errors="coerce")).abs() > 0.011).sum()),
+        "statuses": sorted(out["status"].unique().tolist()),
+        "regions": sorted(out["region"].unique().tolist()),
+        "products": sorted(out["product"].unique().tolist()),
+        "n_customers": int(out["customer"].nunique()),
+        "date_range_IST": [str(out["date"].min()), str(out["date"].max())],
+    }
+
+
+def load():
+    global INFO
+    try:
+        build()
+    except Exception as e:
+        INFO = {"startup_error": str(e)}
+    finally:
+        READY.set()
+
+
+threading.Thread(target=load, daemon=True).start()
+
+
+# ---------- 2. LLM: question -> small JSON plan ----------
+def system_prompt():
+    today = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=5, minutes=30))).date()
+    return f"""You convert a question about an order ledger into JSON. Output ONLY this JSON object:
+{{"metric": "revenue|orders|units|aov|distinct_customers|distinct_products|refund_total|refund_count",
+ "status": null|"paid"|"refunded"|"void"|"all",
+ "group_by": null|"product"|"customer"|"region"|"month",
+ "rank": null|"max"|"min",
+ "top_n": null|integer,
+ "region": null|string, "product": null|string, "customer": null|string,
+ "start": null|"YYYY-MM-DD", "end": null|"YYYY-MM-DD"}}
+
+Rules:
+- Dates are inclusive. "March 2026" => start 2026-03-01, end 2026-03-31. "Q1 2026" => 2026-01-01..2026-03-31. Today is {today}.
+- revenue / sales / income / turnover => metric revenue (status null).
+- refunds / money returned / refunded amount => metric refund_total. "how many refunds / refunded orders" => refund_count.
+- number of orders => orders. units / quantity sold => units. average order value => aov.
+- best seller / top product / product with most sales => metric revenue, group_by product, rank max, top_n 1. If they say "units" or "quantity" use metric units.
+- top customer / biggest spender => metric revenue, group_by customer, rank max, top_n 1.
+- "how many customers" => distinct_customers. "how many different products" => distinct_products.
+- "top 3 ..." => top_n 3. Lowest / least / worst => rank min.
+- Use the exact spelling from the lists below when a name is mentioned. Customer ids look like C1011.
+Regions: {", ".join(INFO.get("regions", []))}
+Products: {", ".join(INFO.get("products", []))}"""
+
+
+def make_plan(q):
+    r = client.chat.completions.create(
+        model=MODEL, temperature=0, response_format={"type": "json_object"},
+        messages=[{"role": "system", "content": system_prompt()},
+                  {"role": "user", "content": q}])
+    return json.loads(r.choices[0].message.content)
+
 
 # ---------- 3. plain code does the maths ----------
-def apply_filters(df, p):
-    if p.get("region"):
-        df = df[df["region"].str.lower() == p["region"].lower()]     # TODO: column name
-    if p.get("product"):
-        df = df[df["product"].str.lower() == p["product"].lower()]   # TODO: column name
-    if p.get("start"):
-        df = df[df["date"] >= pd.Timestamp(p["start"])]
-    if p.get("end"):
-        df = df[df["date"] < pd.Timestamp(p["end"]) + pd.Timedelta(days=1)]
-    return df
+COUNT_METRICS = ("orders", "units", "distinct_customers", "distinct_products")
+
+
+def agg(df, m):
+    if m == "revenue":            return df["amount_usd"].sum()
+    if m == "orders":             return len(df)
+    if m == "units":              return df["qty"].sum()
+    if m == "aov":                return df["amount_usd"].mean() if len(df) else 0.0
+    if m == "distinct_customers": return df["customer"].nunique()
+    if m == "distinct_products":  return df["product"].nunique()
+    raise ValueError("unknown metric " + str(m))
+
+
+def clean(v, m):
+    return int(round(float(v))) if m in COUNT_METRICS else round(float(v), 2)
+
 
 def run(p):
-    m = p["metric"]
-    if m == "revenue":
-        return round(float(apply_filters(orders, p)["amount_usd"].sum()), 2)
-    if m == "order_count":
-        return int(len(apply_filters(orders, p)))
+    d = DATA
+    m = p.get("metric")
+    st = (p.get("status") or "").lower()
     if m == "refund_total":
-        return round(float(apply_filters(refunds, p)["amount_usd"].sum()), 2)
-    if m == "refund_count":
-        return int(len(apply_filters(refunds, p)))
-    if m == "top_product":
-        return apply_filters(orders, p).groupby("product")["amount_usd"].sum().idxmax()
-    if m == "customer_count":
-        return int(apply_filters(orders, p)["customer_id"].nunique())  # TODO: column name
-    raise ValueError(f"unknown metric {m}")
+        m, st = "revenue", (st or "refunded")
+    elif m == "refund_count":
+        m, st = "orders", (st or "refunded")
+    if not st:
+        st = "paid"
+    if st != "all":
+        d = d[d["status"] == st]
+    for col in ("region", "product", "customer"):
+        if p.get(col):
+            d = d[d[col].str.lower() == str(p[col]).strip().lower()]
+    if p.get("start"):
+        d = d[d["date"] >= pd.Timestamp(p["start"], tz=TZ)]
+    if p.get("end"):
+        d = d[d["date"] < pd.Timestamp(p["end"], tz=TZ) + pd.Timedelta(days=1)]
 
-# ---------- 4. the web endpoint ----------
+    g = p.get("group_by")
+    if not g:
+        return clean(agg(d, m), m)
+    key = d["date"].dt.strftime("%Y-%m") if g == "month" else d[g]
+    s = pd.Series({k: agg(grp, m) for k, grp in d.groupby(key)}, dtype=float)
+    rank = p.get("rank") or ("max" if p.get("top_n") else None)
+    if rank:
+        s = s.sort_values(ascending=(rank == "min"), kind="stable")
+        n = int(p.get("top_n") or 1)
+        names = [str(x) for x in s.index[:n]]
+        return names[0] if n == 1 else names
+    return {str(k): clean(v, m) for k, v in s.items()}
+
+
+# ---------- 4. web app ----------
 app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"],
-                   allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
 
 @app.get("/")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "rows": INFO.get("rows_after_dedupe"), "ready": READY.is_set()}
+
+
+@app.get("/debug")
+def debug():
+    return INFO
+
+
+@app.get("/reload")
+def reload():
+    build()
+    return {"ok": True, "rows": INFO.get("rows_after_dedupe")}
+
 
 @app.post("/")
+@app.post("/ask")
 def answer(body: dict):
     try:
-        plan = make_plan(body["question"])
-        return {"answer": run(plan)}
+        READY.wait(60)
+        if DATA is None:
+            build()
+        return {"answer": run(make_plan(body["question"]))}
     except Exception as e:
         return {"answer": None, "error": str(e)}
