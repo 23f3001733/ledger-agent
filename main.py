@@ -134,12 +134,43 @@ Regions: {", ".join(INFO.get("regions", []))}
 Products: {", ".join(INFO.get("products", []))}"""
 
 
+def normalize(p):
+    m = str(p.get("metric") or "").lower()
+    if "refund" in m:
+        m = "refund_count" if ("count" in m or "number" in m or "num" in m) else "refund_total"
+    elif "customer" in m:
+        m = "distinct_customers"
+    elif "product" in m:
+        m = "distinct_products"
+    elif "aov" in m or "average" in m or "avg" in m:
+        m = "aov"
+    elif "unit" in m or "qty" in m or "quantity" in m:
+        m = "units"
+    elif "order" in m or "count" in m:
+        m = "orders"
+    else:
+        m = "revenue"
+    p["metric"] = m
+    if m.startswith("distinct"):
+        p["group_by"] = None
+        p["rank"] = None
+        p["top_n"] = None
+    return p
+
+
 def make_plan(q):
-    r = client.chat.completions.create(
-        model=MODEL, temperature=0, response_format={"type": "json_object"},
-        messages=[{"role": "system", "content": system_prompt()},
-                  {"role": "user", "content": q}])
-    return json.loads(r.choices[0].message.content)
+    last = None
+    for _ in range(2):
+        try:
+            r = client.chat.completions.create(
+                model=MODEL, temperature=0, response_format={"type": "json_object"},
+                messages=[{"role": "system", "content": system_prompt()},
+                          {"role": "user", "content": q}])
+            return normalize(json.loads(r.choices[0].message.content))
+        except Exception as e:
+            last = e
+            time.sleep(0.5)
+    raise last
 
 
 # ---------- 3. plain code does the maths ----------
