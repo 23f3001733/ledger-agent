@@ -91,4 +91,99 @@ def sync_database():
                 print("Error fetching orders:", e)
                 break
 
-    df_orders = pd.DataFrame(all
+    df_orders = pd.DataFrame(all_orders)
+    
+    # Define expected columns so empty data doesn't crash SQLite
+    order_cols = [
+        "order_id", "status", "region", "created_at", "updated_at",
+        "amount", "currency", "product_name", "customer_id", 
+        "created_date", "created_year_month", "usd_amount", "updated_at_dt"
+    ]
+
+    if df_orders.empty:
+        df_orders = pd.DataFrame(columns=order_cols)
+    else:
+        # Standardize ID
+        if "order_id" not in df_orders.columns and "id" in df_orders.columns:
+            df_orders["order_id"] = df_orders["id"]
+
+        # Parse timezone securely and deduplicate
+        df_orders["updated_at_dt"] = pd.to_datetime(df_orders.get("updated_at"), utc=True, errors="coerce")
+        df_orders = df_orders.sort_values("updated_at_dt").groupby("order_id").last().reset_index()
+
+        # Convert to Asia/Kolkata Timezone
+        created_dt = pd.to_datetime(df_orders.get("created_at"), utc=True, errors="coerce").dt.tz_convert("Asia/Kolkata")
+        df_orders["created_date"] = created_dt.dt.strftime("%Y-%m-%d")
+        df_orders["created_year_month"] = created_dt.dt.strftime("%Y-%m")
+
+        # Map USD values
+        rate_map = df_rates.set_index("currency")["rate_to_usd"].to_dict() if not df_rates.empty else {}
+        
+        def calc_usd(row):
+            amt = float(row.get("amount", 0.0) or 0.0)
+            rate = float(rate_map.get(row.get("currency"), 1.0))
+            return amt * rate
+            
+        df_orders["usd_amount"] = df_orders.apply(calc_usd, axis=1)
+        df_orders["updated_at_dt"] = df_orders["updated_at_dt"].astype(str)
+
+        # Ensure all columns exist before SQL write
+        for col in order_cols:
+            if col not in df_orders.columns:
+                df_orders[col] = None
+
+    # 3. Persist to SQLite
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        df_orders.to_sql("orders", conn, if_exists="replace", index=False)
+        df_rates.to_sql("rates", conn, if_exists="replace", index=False)
+        conn.close()
+        print("Database sync completed successfully.")
+    except Exception as e:
+        print("Failed to save to SQLite:", e)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    sync_database()
+    yield
+
+app = FastAPI(lifespan=lifespan)
+
+class QuestionRequest(BaseModel):
+    question: str
+
+def execute_sql_query(query: str):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(query)
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result is None or result[0] is None:
+            return 0
+        val = result[0]
+        return round(float(val), 2) if isinstance(val, (float, int)) and not isinstance(val, bool) else val
+    except Exception as e:
+        print("SQL Error:", e, "\nQuery was:", query)
+        return 0
+
+@app.post("/")
+async def answer_question(payload: QuestionRequest):
+    try:
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": payload.question}
+            ],
+            temperature=0.0
+        )
+        content = response.choices[0].message.content
+        match = re.search(r"```sql\s*(.*?)\s*```", content, re.DOTALL)
+        sql_query = match.group(1).strip() if match else content.strip()
+        
+        answer = execute_sql_query(sql_query)
+        return {"answer": answer}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
