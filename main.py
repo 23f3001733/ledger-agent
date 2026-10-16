@@ -256,13 +256,30 @@ def reload():
     return {"ok": True, "rows": INFO.get("rows_after_dedupe")}
 
 
+from fastapi import Request
+from fastapi.concurrency import run_in_threadpool
+
+
+def solve(question):
+    READY.wait(60)
+    if DATA is None:
+        build()
+    return run(make_plan(question))
+
+
 @app.post("/")
 @app.post("/ask")
-def answer(body: dict):
+@app.post("/{full_path:path}")
+async def answer(request: Request, full_path: str = ""):
     try:
-        READY.wait(60)
-        if DATA is None:
-            build()
-        return {"answer": run(make_plan(body["question"]))}
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if isinstance(body, str):
+            q = body
+        else:
+            q = body.get("question") or body.get("q") or body.get("query") or ""
+        return {"answer": await run_in_threadpool(solve, q)}
     except Exception as e:
         return {"answer": None, "error": str(e)}
