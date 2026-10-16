@@ -1,285 +1,171 @@
-import os, re, json, time, datetime, threading
-import requests, pandas as pd
-from concurrent.futures import ThreadPoolExecutor
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+import os
+import re
+import sqlite3
+import pandas as pd
+import requests
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 from openai import OpenAI
 
-# ---------- settings (from Render environment variables) ----------
-ORDERS_URL = os.environ["ORDERS_URL"]
-RATES_URL = os.environ.get("RATES_URL", "")
-MODEL = os.environ.get("LLM_MODEL", "gpt-4.1-mini")
-client = OpenAI(
-    api_key=os.environ["LLM_KEY"],
-    base_url=os.environ.get("LLM_BASE") or "https://api.openai.com/v1",
-    timeout=10, max_retries=1,
-)
-TZ = "Asia/Kolkata"
-DEFAULT_RATES = {"USD": 1.0, "EUR": 1.05, "INR": 0.01111}
+# Environment Variables
+ORDERS_URL = os.environ.get("ORDERS_URL")
+RATES_URL = os.environ.get("RATES_URL")
+LLM_KEY = os.environ.get("LLM_KEY")
+LLM_BASE = os.environ.get("LLM_BASE", "https://aipipe.org/openai/v1")
+LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4.1-mini")
 
-DATA, INFO = None, {}
-READY = threading.Event()
+DB_PATH = "ledger.db"
 
+client = OpenAI(api_key=LLM_KEY, base_url=LLM_BASE)
 
-def get_json(url, tries=4):
-    for i in range(tries):
-        try:
-            r = requests.get(url, timeout=20)
-            r.raise_for_status()
-            return r.json()
-        except Exception:
-            if i == tries - 1:
-                raise
-            time.sleep(1 + i)
+SYSTEM_PROMPT = """
+You are an expert SQLite query generator. Given a natural language question about an order ledger, output ONLY a single valid SQL query.
 
+Database Schema (Table: `orders`):
+- order_id (TEXT): Unique ID of the order.
+- status (TEXT): Order status e.g., 'paid', 'refunded', 'pending'. Always use LOWER(status) when comparing.
+- region (TEXT): Region name e.g., 'Central', 'North', 'South', 'East', 'West'. Always use LOWER(region) when comparing.
+- created_at (TEXT): ISO timestamp string.
+- created_date (TEXT): Date in 'YYYY-MM-DD' format (Asia/Kolkata timezone).
+- created_year_month (TEXT): Date in 'YYYY-MM' format e.g., '2026-02' (Asia/Kolkata timezone).
+- amount (REAL): Monetary amount.
+- currency (TEXT): Currency code e.g., 'USD', 'INR', 'EUR'.
+- product_name (TEXT): Name of the product.
+- customer_id (TEXT): Customer identifier.
+- usd_amount (REAL): Amount converted directly to USD.
 
-def page_url(p):
-    if re.search(r"([?&])page=\d+", ORDERS_URL):
-        return re.sub(r"([?&])page=\d+", r"\g<1>page=%d" % p, ORDERS_URL)
-    return ORDERS_URL + "&page=%d" % p
+Database Schema (Table: `rates`):
+- currency (TEXT): Currency code.
+- rate_to_usd (REAL): Conversion multiplier to USD.
 
+Rules for Query Generation:
+1. ALWAYS wrap aggregate results with COALESCE to prevent null returns:
+   - Use `SELECT COALESCE(COUNT(*), 0)` instead of `SELECT COUNT(*)`.
+   - Use `SELECT COALESCE(SUM(usd_amount), 0.0)` for revenue queries.
+2. Filter status and region case-insensitively using LOWER():
+   - e.g., `LOWER(status) = 'refunded'` AND `LOWER(region) = 'central'`
+3. Revenue queries strictly require `LOWER(status) = 'paid'`.
+4. For month/year questions (e.g., "February 2026"), filter using `created_year_month = '2026-02'`.
+5. Return ONLY the raw SQL query enclosed inside ```sql ... ``` code blocks.
+"""
 
-# ---------- 1. load + clean data ----------
-def build():
-    global DATA, INFO
-    rows, n_pages = None, 0
-    export_url = os.environ.get("EXPORT_URL", "")
-    if export_url:
-        try:
-            txt = requests.get(export_url, timeout=30).text
-            rows = [json.loads(l) for l in txt.splitlines() if l.strip()]
-            n_pages = -1
-        except Exception:
-            rows = None
-    if not rows:
-        first = get_json(page_url(1))
-        rows = list(first["orders"])
-        n_pages = int(first.get("pages", 1))
-        if n_pages > 1:
-            with ThreadPoolExecutor(8) as ex:
-                for d in ex.map(lambda p: get_json(page_url(p)), range(2, n_pages + 1)):
-                    rows += d["orders"]
-    df = pd.DataFrame(rows)
-    raw_rows = len(df)
+def fetch_all_orders():
+    all_orders = []
+    page = 1
+    # Strip existing page param to construct standard pagination URL
+    base_url = ORDERS_URL.split("&page=")[0] if ORDERS_URL else ""
+    
+    while True:
+        url = f"{base_url}&page={page}"
+        res = requests.get(url, timeout=15)
+        if res.status_code != 200:
+            break
+        data = res.json()
+        orders = data.get("orders", data.get("data", []))
+        if not orders:
+            break
+        all_orders.extend(orders)
+        
+        has_next = data.get("has_next", False) or page < data.get("total_pages", 1)
+        if not has_next:
+            break
+        page += 1
+        
+    return pd.DataFrame(all_orders)
 
-    # latest updated_at wins (compare as real moments, not text)
-    df["_u"] = pd.to_datetime(df["updated_at"], utc=True, format="ISO8601")
-    df = df.sort_values("_u", kind="stable").drop_duplicates("id", keep="last")
+def sync_database():
+    if not ORDERS_URL or not RATES_URL:
+        print("Missing ORDERS_URL or RATES_URL environment variables.")
+        return
 
-    # rates: USD value of one unit of each currency
-    rates = dict(DEFAULT_RATES)
-    if RATES_URL:
-        try:
-            r = get_json(RATES_URL)
-            rates = {k.upper(): float(v) for k, v in r["usd_per_unit"].items()}
-        except Exception:
-            pass
-
-    out = pd.DataFrame(index=df.index)
-    out["id"] = df["id"]
-    out["date"] = pd.to_datetime(df["created_at"], utc=True, format="ISO8601").dt.tz_convert(TZ)
-    out["status"] = df["status"].astype(str).str.strip().str.lower()
-    out["region"] = df["region"].astype(str).str.strip()
-    out["product"] = df["product"].astype(str).str.strip()
-    out["customer"] = df["customer"].astype(str).str.strip()
-    out["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(0)
-    cur = df["currency"].astype(str).str.strip().str.upper()
-    mult = cur.map(rates)
-    out["amount_usd"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0) * mult.fillna(0)
-
-    DATA = out
-    INFO = {
-        "raw_rows": raw_rows,
-        "rows_after_dedupe": len(out),
-        "pages": n_pages,
-        "rates": rates,
-        "unmapped_currency_rows": int(mult.isna().sum()),
-        "amount_vs_qty_x_price_mismatches": int(
-            ((pd.to_numeric(df["amount"], errors="coerce")
-              - pd.to_numeric(df["qty"], errors="coerce") * pd.to_numeric(df["unit_price"], errors="coerce")).abs() > 0.011).sum()),
-        "statuses": sorted(out["status"].unique().tolist()),
-        "regions": sorted(out["region"].unique().tolist()),
-        "products": sorted(out["product"].unique().tolist()),
-        "n_customers": int(out["customer"].nunique()),
-        "date_range_IST": [str(out["date"].min()), str(out["date"].max())],
-    }
-
-
-def load():
-    global INFO
-    try:
-        build()
-    except Exception as e:
-        INFO = {"startup_error": str(e)}
-    finally:
-        READY.set()
-
-
-threading.Thread(target=load, daemon=True).start()
-
-
-# ---------- 2. LLM: question -> small JSON plan ----------
-def system_prompt():
-    today = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=5, minutes=30))).date()
-    return f"""You convert a question about an order ledger into JSON. Output ONLY this JSON object:
-{{"metric": "revenue|orders|units|aov|distinct_customers|distinct_products|refund_total|refund_count",
- "status": null|"paid"|"refunded"|"void"|"all",
- "group_by": null|"product"|"customer"|"region"|"month",
- "rank": null|"max"|"min",
- "top_n": null|integer,
- "region": null|string, "product": null|string, "customer": null|string,
- "start": null|"YYYY-MM-DD", "end": null|"YYYY-MM-DD"}}
-
-Rules:
-- Dates are inclusive. "March 2026" => start 2026-03-01, end 2026-03-31. "Q1 2026" => 2026-01-01..2026-03-31. Today is {today}.
-- revenue / sales / income / turnover => metric revenue (status null).
-- refunds / money returned / refunded amount => metric refund_total. "how many refunds / refunded orders" => refund_count.
-- number of orders => orders. units / quantity sold => units. average order value => aov.
-- best seller / top product / product with most sales => metric revenue, group_by product, rank max, top_n 1. If they say "units" or "quantity" use metric units.
-- top customer / biggest spender => metric revenue, group_by customer, rank max, top_n 1.
-- "how many customers" => distinct_customers. "how many different products" => distinct_products.
-- "top 3 ..." => top_n 3. Lowest / least / worst => rank min.
-- Use the exact spelling from the lists below when a name is mentioned. Customer ids look like C1011.
-Regions: {", ".join(INFO.get("regions", []))}
-Products: {", ".join(INFO.get("products", []))}"""
-
-
-def normalize(p):
-    m = str(p.get("metric") or "").lower()
-    if "refund" in m:
-        m = "refund_count" if ("count" in m or "number" in m or "num" in m) else "refund_total"
-    elif "customer" in m:
-        m = "distinct_customers"
-    elif "product" in m:
-        m = "distinct_products"
-    elif "aov" in m or "average" in m or "avg" in m:
-        m = "aov"
-    elif "unit" in m or "qty" in m or "quantity" in m:
-        m = "units"
-    elif "order" in m or "count" in m:
-        m = "orders"
+    print("Fetching rates...")
+    rates_res = requests.get(RATES_URL, timeout=15).json()
+    rates_data = rates_res.get("rates", {})
+    
+    # Format exchange rates into DataFrame
+    if isinstance(rates_data, dict):
+        df_rates = pd.DataFrame([{"currency": k, "rate_to_usd": v} for k, v in rates_data.items()])
     else:
-        m = "revenue"
-    p["metric"] = m
-    if m.startswith("distinct"):
-        p["group_by"] = None
-        p["rank"] = None
-        p["top_n"] = None
-    return p
+        df_rates = pd.DataFrame(rates_data)
 
+    print("Fetching orders...")
+    df_orders = fetch_all_orders()
+    
+    if df_orders.empty:
+        print("No orders fetched.")
+        return
 
-def make_plan(q):
-    last = None
-    for _ in range(2):
-        try:
-            r = client.chat.completions.create(
-                model=MODEL, temperature=0, response_format={"type": "json_object"},
-                messages=[{"role": "system", "content": system_prompt()},
-                          {"role": "user", "content": q}])
-            return normalize(json.loads(r.choices[0].message.content))
-        except Exception as e:
-            last = e
-            time.sleep(0.5)
-    raise last
+    # Normalize ID field
+    if "order_id" not in df_orders.columns and "id" in df_orders.columns:
+        df_orders["order_id"] = df_orders["id"]
 
+    # Deduplicate orders: Sort by updated_at and keep the last entry per order_id
+    df_orders["updated_at_dt"] = pd.to_datetime(df_orders["updated_at"], errors="coerce")
+    df_orders = df_orders.sort_values("updated_at_dt").groupby("order_id").last().reset_index()
 
-# ---------- 3. plain code does the maths ----------
-COUNT_METRICS = ("orders", "units", "distinct_customers", "distinct_products")
+    # Convert timestamps strictly to Asia/Kolkata timezone
+    created_dt = pd.to_datetime(df_orders["created_at"], utc=True).dt.tz_convert("Asia/Kolkata")
+    df_orders["created_date"] = created_dt.dt.strftime("%Y-%m-%d")
+    df_orders["created_year_month"] = created_dt.dt.strftime("%Y-%m")
 
+    # Map USD converted amounts directly into the table
+    rate_map = df_rates.set_index("currency")["rate_to_usd"].to_dict() if not df_rates.empty else {}
+    df_orders["usd_amount"] = df_orders.apply(
+        lambda r: float(r["amount"]) * rate_map.get(r["currency"], 1.0), axis=1
+    )
 
-def agg(df, m):
-    if m == "revenue":            return df["amount_usd"].sum()
-    if m == "orders":             return len(df)
-    if m == "units":              return df["qty"].sum()
-    if m == "aov":                return df["amount_usd"].mean() if len(df) else 0.0
-    if m == "distinct_customers": return df["customer"].nunique()
-    if m == "distinct_products":  return df["product"].nunique()
-    raise ValueError("unknown metric " + str(m))
+    # Persist into SQLite
+    conn = sqlite3.connect(DB_PATH)
+    df_orders.to_sql("orders", conn, if_exists="replace", index=False)
+    df_rates.to_sql("rates", conn, if_exists="replace", index=False)
+    conn.close()
+    print("Database sync completed successfully.")
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Perform database sync on server launch
+    sync_database()
+    yield
 
-def clean(v, m):
-    return int(round(float(v))) if m in COUNT_METRICS else round(float(v), 2)
+app = FastAPI(lifespan=lifespan)
 
+class QuestionRequest(BaseModel):
+    question: str
 
-def run(p):
-    d = DATA
-    m = p.get("metric")
-    st = (p.get("status") or "").lower()
-    if m == "refund_total":
-        m, st = "revenue", (st or "refunded")
-    elif m == "refund_count":
-        m, st = "orders", (st or "refunded")
-    if not st:
-        st = "paid"
-    if st != "all":
-        d = d[d["status"] == st]
-    for col in ("region", "product", "customer"):
-        if p.get(col):
-            d = d[d[col].str.lower() == str(p[col]).strip().lower()]
-    if p.get("start"):
-        d = d[d["date"] >= pd.Timestamp(p["start"], tz=TZ)]
-    if p.get("end"):
-        d = d[d["date"] < pd.Timestamp(p["end"], tz=TZ) + pd.Timedelta(days=1)]
-
-    g = p.get("group_by")
-    if not g:
-        return clean(agg(d, m), m)
-    key = d["date"].dt.strftime("%Y-%m") if g == "month" else d[g]
-    s = pd.Series({k: agg(grp, m) for k, grp in d.groupby(key)}, dtype=float)
-    rank = p.get("rank") or ("max" if p.get("top_n") else None)
-    if rank:
-        s = s.sort_values(ascending=(rank == "min"), kind="stable")
-        n = int(p.get("top_n") or 1)
-        names = [str(x) for x in s.index[:n]]
-        return names[0] if n == 1 else names
-    return {str(k): clean(v, m) for k, v in s.items()}
-
-
-# ---------- 4. web app ----------
-app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-
-@app.get("/")
-def health():
-    return {"status": "ok", "rows": INFO.get("rows_after_dedupe"), "ready": READY.is_set()}
-
-
-@app.get("/debug")
-def debug():
-    return INFO
-
-
-@app.get("/reload")
-def reload():
-    build()
-    return {"ok": True, "rows": INFO.get("rows_after_dedupe")}
-
-
-from fastapi import Request
-from fastapi.concurrency import run_in_threadpool
-
-
-def solve(question):
-    READY.wait(60)
-    if DATA is None:
-        build()
-    return run(make_plan(question))
-
+def execute_sql_query(query: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(query)
+    result = cursor.fetchone()
+    conn.close()
+    
+    if result is None or result[0] is None:
+        return 0
+    
+    val = result[0]
+    return round(float(val), 2) if isinstance(val, (float, int)) and not isinstance(val, bool) else val
 
 @app.post("/")
-@app.post("/ask")
-@app.post("/{full_path:path}")
-async def answer(request: Request, full_path: str = ""):
+async def answer_question(payload: QuestionRequest):
+    question = payload.question
+    
     try:
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        if isinstance(body, str):
-            q = body
-        else:
-            q = body.get("question") or body.get("q") or body.get("query") or ""
-        return {"answer": await run_in_threadpool(solve, q)}
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": question}
+            ],
+            temperature=0.0
+        )
+        
+        content = response.choices[0].message.content
+        match = re.search(r"```sql\s*(.*?)\s*```", content, re.DOTALL)
+        sql_query = match.group(1).strip() if match else content.strip()
+        
+        answer = execute_sql_query(sql_query)
+        return {"answer": answer}
+        
     except Exception as e:
-        return {"answer": None, "error": str(e)}
+        raise HTTPException(status_code=500, detail=f"Error processing question: {str(e)}")
