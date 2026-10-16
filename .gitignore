@@ -1,2 +1,14 @@
-.env
+# Python environment & cache
 __pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Database files (Render pe fresh generate hoga)
+*.db
+*.sqlite3
+
+# Environment keys / secret files
+.env
